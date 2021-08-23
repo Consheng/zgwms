@@ -1,0 +1,1368 @@
+package ykk.xc.com.zgwms.sales
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.content.*
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import android.hardware.usb.UsbManager
+import android.os.Bundle
+import android.os.Handler
+import android.os.Message
+import android.support.v7.widget.DividerItemDecoration
+import android.support.v7.widget.LinearLayoutManager
+import android.text.Editable
+import android.text.Html
+import android.text.TextWatcher
+import android.view.KeyEvent
+import android.view.View
+import butterknife.OnClick
+import com.gprinter.command.EscCommand
+import com.gprinter.command.LabelCommand
+import com.huawei.hms.hmsscankit.ScanUtil
+import com.huawei.hms.ml.scan.HmsScan
+import com.huawei.hms.ml.scan.HmsScanAnalyzerOptions
+import kotlinx.android.synthetic.main.sal_out_stock_saoma.*
+import okhttp3.*
+import ykk.xc.com.zgwms.R
+import ykk.xc.com.zgwms.basics.Logistics_DialogActivity
+import ykk.xc.com.zgwms.basics.Stock_DialogActivity
+import ykk.xc.com.zgwms.bean.*
+import ykk.xc.com.zgwms.bean.k3Bean.StockPosition_K3
+import ykk.xc.com.zgwms.bean.k3Bean.Stock_K3
+import ykk.xc.com.zgwms.bean.sales.SalOrderEntry
+import ykk.xc.com.zgwms.comm.BaseActivity
+import ykk.xc.com.zgwms.comm.BaseFragment
+import ykk.xc.com.zgwms.comm.Comm
+import ykk.xc.com.zgwms.sales.adapter.Sal_OutStock_SaoMa_Adapter
+import ykk.xc.com.zgwms.util.BigdecimalUtil
+import ykk.xc.com.zgwms.util.JsonUtil
+import ykk.xc.com.zgwms.util.LogUtil
+import ykk.xc.com.zgwms.util.basehelper.BaseRecyclerAdapter
+import ykk.xc.com.zgwms.util.blueTooth.*
+import ykk.xc.com.zgwms.util.blueTooth.Constant.MESSAGE_UPDATE_PARAMETER
+import ykk.xc.com.zgwms.util.blueTooth.DeviceConnFactoryManager.CONN_STATE_FAILED
+import java.io.IOException
+import java.lang.ref.WeakReference
+import java.util.*
+import java.util.concurrent.TimeUnit
+import kotlin.collections.HashMap
+
+/**
+ * 日期：2019-10-16 09:14
+ * 描述：销售出库扫描
+ * 作者：ykk
+ */
+class Sal_OutStock_SaoMaActivity : BaseActivity() {
+
+    companion object {
+        private val SEL_STOCK = 60
+        private val SEL_LOGISTICS = 62
+        private val SUCC1 = 200
+        private val UNSUCC1 = 500
+        private val SAVE = 201
+        private val UNSAVE = 501
+        private val UPLOAD = 202
+        private val UNUPLOAD = 502
+        private val SUCC4 = 203
+        private val UNSUCC4 = 503
+        private val SUCC5 = 204
+        private val UNSUCC5 = 504
+
+        private val SETFOCUS = 1
+        private val SAOMA = 2
+        private val WRITE_CODE = 3
+        private val RESULT_NUM = 4
+        private val SM_RESULT_NUM = 5
+        private val RESULT_YUYUE = 6
+    }
+
+    private val context = this
+    private val TAG = "Sal_OutStock_SaoMaActivity"
+    private var okHttpClient: OkHttpClient? = null
+    private var mAdapter: Sal_OutStock_SaoMa_Adapter? = null
+    private val checkDatas = ArrayList<ICStockBillEntry>()
+    private var curPos = -1 // 当前行
+    private var user: User? = null
+    private var smqFlag = '1' // 扫描类型1：位置扫描，2：物料扫描
+    private var isTextChange: Boolean = false // 是否进入TextChange事件
+    private val icstockBill = ICStockBill()
+    private var salOrderEntry :SalOrderEntry? = null
+    private var deliveryWayRemark :String? = null
+    private var stock:Stock_K3? = null
+    private var stockPos: StockPosition_K3? = null
+    private var logistics :Logistics? = null    // 快递公司
+
+    // 蓝牙打印用到的
+    private var isConnected: Boolean = false // 蓝牙是否连接标识
+    private val id = 0 // 设备id
+    private var threadPool: ThreadPool? = null
+    private val CONN_STATE_DISCONN = 0x007 // 连接状态断开
+    private val PRINTER_COMMAND_ERROR = 0x008 // 使用打印机指令错误
+    private val CONN_PRINTER = 0x12
+    private var listMap = ArrayList<ExpressNoData>() // 打印保存的数据
+
+    // 消息处理
+    private val mHandler = MyHandler(this)
+    private class MyHandler(activity: Sal_OutStock_SaoMaActivity) : Handler() {
+        private val mActivity: WeakReference<Sal_OutStock_SaoMaActivity>
+
+        init {
+            mActivity = WeakReference(activity)
+        }
+
+        override fun handleMessage(msg: Message) {
+            val m = mActivity.get()
+            if (m != null) {
+                m.hideLoadDialog()
+
+                var errMsg: String? = null
+                var msgObj: String? = null
+                if (msg.obj is String) {
+                    msgObj = msg.obj as String
+                }
+                when (msg.what) {
+                    SUCC1 -> { // 扫码成功 进入
+                        val salEntry = JsonUtil.strToObject(msgObj, SalOrderEntry::class.java)
+                        var deliveryWayRemarkT = m.isNULLS(salEntry.salOrder.deliveryWayRemark)
+                        if(salEntry.combineSalOrderId == 0) {
+                            if(m.deliveryWayRemark != null && !m.deliveryWayRemark.equals(deliveryWayRemarkT)) {
+                                Comm.showWarnDialog(m.context,"当前扫描的发货方式（"+deliveryWayRemarkT+"）和列表中（"+m.deliveryWayRemark+"）的不一致！")
+                                return
+                            }
+                            if(m.salOrderEntry != null && salEntry.fid != m.salOrderEntry!!.fid) {
+                                Comm.showWarnDialog(m.context,"只能扫描相同订单（"+m.salOrderEntry!!.salOrder.fbillNo+"）的条码！")
+                                return
+                            }
+                        } else {
+                            if (m.salOrderEntry != null && salEntry.combineSalOrderId != m.salOrderEntry!!.combineSalOrderId) {
+                                Comm.showWarnDialog(m.context, "当前扫描的订单不属于拼单订单，请扫描拼单中的订单！")
+                                return
+                            }
+                        }
+
+                        if(!deliveryWayRemarkT.equals("快递")) {// 非快递的无需预约
+                            deliveryWayRemarkT = "物流"
+                            m.btn_appointment.visibility = View.INVISIBLE
+                        }
+                        m.tv_deliveryWayRemark.text = Html.fromHtml("发货方式:&nbsp;<font color='#6a5acd'>"+deliveryWayRemarkT+"</font>")
+                        m.salOrderEntry = salEntry
+                        m.deliveryWayRemark = deliveryWayRemarkT
+                        m.getMtl()
+                    }
+                    UNSUCC1 -> { // 扫码失败
+                        errMsg = JsonUtil.strToString(msgObj)
+                        if (m.isNULLS(errMsg).length == 0) errMsg = "很抱歉，没有找到数据！"
+                        Comm.showWarnDialog(m.context, errMsg)
+                    }
+                    SAVE -> { // 保存成功 进入
+                        val strId_pdaNo = JsonUtil.strToString(msgObj)
+                        if(m.icstockBill.id == 0) {
+                            val arr = strId_pdaNo.split(":") // id和pdaNo数据拼接（1:IC201912121）
+                            m.icstockBill.id = m.parseInt(arr[0])
+                            m.icstockBill.pdaNo = arr[1]
+                        }
+
+                        m.toasts("已保存，正在上传")
+                        m.btn_save.visibility = View.GONE
+                        m.btn_upload.visibility = View.VISIBLE
+                        m.btn_appointment.visibility = View.INVISIBLE
+
+                        m.run_uploadToK3(m.icstockBill.id.toString())
+                    }
+                    UNSAVE -> { // 保存失败
+                        errMsg = JsonUtil.strToString(msgObj)
+                        if (m.isNULLS(errMsg).length == 0) errMsg = "保存失败！"
+                        Comm.showWarnDialog(m.context, errMsg)
+                    }
+                    UPLOAD -> { // 上传成功 进入
+                        m.reset()
+                        m.toasts("已上传")
+                    }
+                    UNUPLOAD -> { // 上传失败
+                        errMsg = JsonUtil.strToString(msgObj)
+                        if (m.isNULLS(errMsg).length == 0) errMsg = "服务器繁忙，请稍后再试！"
+                        if(errMsg!!.indexOf("库存") > -1) {
+                            m.btn_upload.visibility = View.GONE
+                        }
+                        Comm.showWarnDialog(m.context, errMsg)
+                    }
+                    SUCC4 -> { // 预约数据 进入
+                        m.toasts("预约成功，准备打印...")
+                        val list = JsonUtil.strToList(msgObj, ExpressNoData::class.java)
+                        m.print(list) // 打印
+                        val strExpressNo = StringBuffer()
+                        strExpressNo.append(m.isNULLS(m.icstockBill.expressNo))
+                        list.forEach {
+                            if(strExpressNo.indexOf(it.t01) == -1) { // 不存在的时候，就保存起来
+                                if(strExpressNo.length == 0) {
+                                    strExpressNo.append(it.t01)
+                                } else {
+                                    strExpressNo.append("," + it.t01)
+                                }
+                            }
+                        }
+                        m.icstockBill.expressNo = strExpressNo.toString()
+                        // 预约成功了，只能点击保存，不能扫码
+                        m.et_code.isEnabled = false
+                        m.btn_scan.isEnabled = false
+                        m.lin_focusMtl.setBackgroundResource(R.drawable.back_style_gray1a)
+                    }
+                    UNSUCC4 -> { // 预约数据  失败
+                        errMsg = JsonUtil.strToString(msgObj)
+                        if (m.isNULLS(errMsg).length == 0) errMsg = "app预约失败！"
+                        Comm.showWarnDialog(m.context, errMsg)
+                    }
+                    SUCC5 -> { // 查询赠品 进入
+                        val listSal = JsonUtil.strToList (msgObj, SalOrderEntry::class.java)
+                        m.addRow_salOrder(listSal)
+                    }
+                    UNSUCC5 -> { // 查询赠品  失败
+
+                    }
+                    SETFOCUS -> { // 当弹出其他窗口会抢夺焦点，需要跳转下，才能正常得到值
+                        m.setFocusable(m.et_getFocus)
+                        m.setFocusable(m.et_code)
+                    }
+                    SAOMA -> { // 扫码之后
+                        // 执行查询方法
+                        m.run_smDatas()
+                    }
+                    m.CONN_STATE_DISCONN -> if (DeviceConnFactoryManager.getDeviceConnFactoryManagers()[m.id] != null) {
+                        DeviceConnFactoryManager.getDeviceConnFactoryManagers()[m.id].closePort(m.id)
+                    }
+                    m.PRINTER_COMMAND_ERROR -> Utils.toast(m.context, m.getString(R.string.str_choice_printer_command))
+                    m.CONN_PRINTER -> Utils.toast(m.context, m.getString(R.string.str_cann_printer))
+                    MESSAGE_UPDATE_PARAMETER -> {
+                        val strIp = msg.data.getString("Ip")
+                        val strPort = msg.data.getString("Port")
+                        //初始化端口信息
+                        DeviceConnFactoryManager.Build()
+                                //设置端口连接方式
+                                .setConnMethod(DeviceConnFactoryManager.CONN_METHOD.WIFI)
+                                //设置端口IP地址
+                                .setIp(strIp)
+                                //设置端口ID（主要用于连接多设备）
+                                .setId(m.id)
+                                //设置连接的热点端口号
+                                .setPort(Integer.parseInt(strPort))
+                                .build()
+                        m.threadPool = ThreadPool.getInstantiation()
+                        m.threadPool!!.addTask(Runnable { DeviceConnFactoryManager.getDeviceConnFactoryManagers()[m.id].openPort() })
+                    }
+                }
+            }
+        }
+    }
+
+    override fun setLayoutResID(): Int {
+        return R.layout.sal_out_stock_saoma
+    }
+
+    override fun initView() {
+        if (okHttpClient == null) {
+            okHttpClient = OkHttpClient.Builder()
+                    //                .connectTimeout(10, TimeUnit.SECONDS) // 设置连接超时时间（默认为10秒）
+                    .writeTimeout(120, TimeUnit.SECONDS) // 设置写的超时时间
+                    .readTimeout(120, TimeUnit.SECONDS) //设置读取超时时间
+                    .build()
+        }
+
+        recyclerView.addItemDecoration(DividerItemDecoration(context, DividerItemDecoration.VERTICAL))
+        recyclerView.layoutManager = LinearLayoutManager(context)
+        mAdapter = Sal_OutStock_SaoMa_Adapter(context, checkDatas)
+        recyclerView.adapter = mAdapter
+        // 设值listview空间失去焦点
+        recyclerView.isFocusable = false
+
+        // 行事件
+        mAdapter!!.setCallBack(object : Sal_OutStock_SaoMa_Adapter.MyCallBack {
+            override fun onDelete(entity: ICStockBillEntry, pos: Int) {
+                if(checkDatas[pos].icstockBill.id > 0) return
+                checkDatas.removeAt(pos)
+                mAdapter!!.notifyDataSetChanged()
+            }
+        })
+        // 输入数量
+        mAdapter!!.onItemClickListener = BaseRecyclerAdapter.OnItemClickListener { adapter, holder, view, pos ->
+            if(checkDatas[pos].icstockBill.id > 0) return@OnItemClickListener
+            val mtl = checkDatas[pos].material
+            if(mtl.isSnManager == 1 || mtl.isBatchManager == 1) return@OnItemClickListener
+
+            curPos = pos
+            showInputDialog("出库数", checkDatas[pos].fqty.toString(), "0.0", RESULT_NUM)
+        }
+        // 长按选择仓库
+        mAdapter!!.onItemLongClickListener = BaseRecyclerAdapter.OnItemLongClickListener{ adapter, holder, view, pos ->
+            if(checkDatas[pos].icstockBill.id > 0) return@OnItemLongClickListener
+
+            curPos = pos
+            val bundle = Bundle()
+            bundle.putInt("fuseOrgId", icstockBill.fstockOrgId)
+            showForResult(Stock_DialogActivity::class.java, SEL_STOCK, bundle)
+        }
+    }
+
+    override fun initData() {
+        getUserInfo()
+        bundle()
+        hideSoftInputMode(et_code)
+        mHandler.sendEmptyMessage(SETFOCUS)
+
+        if(user!!.organization == null) {
+            Comm.showWarnDialog(context,"登陆的用户没有维护组织，请在WMS维护！3秒后自动关闭...")
+            mHandler.postDelayed(Runnable {
+                context!!.finish()
+            },3000)
+            return
+        }
+
+        icstockBill.billType = "XSCK" // 销售出库
+        icstockBill.ftranType = 30
+        icstockBill.fselTranType = 1
+        icstockBill.empNumber = user!!.kdUserNumber
+        icstockBill.empName = user!!.kdUserName
+        icstockBill.stockManagerNumber = user!!.kdUserNumber
+        icstockBill.stockManagerName = user!!.kdUserName
+        icstockBill.createUserId = user!!.id
+        icstockBill.createUserName = user!!.username
+
+        icstockBill.fstockOrgId = user!!.organizationId
+        icstockBill.fstockOutOrgId = user!!.organizationId
+        icstockBill.stockOrg = user!!.organization
+        icstockBill.stockOutOrg = user!!.organization
+        icstockBill.fbillTypeNumber = "XSCKD01_SYS" // 生产订单据类型（标准生产入库）
+        icstockBill.fownerType = "BD_OwnerOrg"
+        icstockBill.fownerNumber = user!!.organization.fnumber
+        icstockBill.fownerName = user!!.organization.fname
+        icstockBill.expressNo = ""
+
+        // 显示记录的本地仓库
+        val saveDefaultStock = getResStr(R.string.saveDefaultStock)
+        val spfStock = spf(saveDefaultStock)
+        // 显示仓库---------------------
+        if(spfStock.contains(icstockBill.stockOrg.fnumber+"_BIND_SAL_OUT_STOCK")) {
+            stock = showObjectByXml(Stock_K3::class.java, icstockBill.stockOrg.fnumber+"_BIND_SAL_OUT_STOCK", saveDefaultStock)
+        }
+    }
+
+    private fun bundle() {
+        val bundle = context.intent.extras
+        if (bundle != null) {
+        }
+    }
+
+    @OnClick(R.id.btn_close, R.id.btn_scan, R.id.btn_save, R.id.btn_clone, R.id.btn_upload, R.id.btn_appointment)
+    fun onViewClicked(view: View) {
+        when (view.id) {
+            R.id.btn_close -> { // 关闭
+                if (checkDatas.size > 0) {
+                    val build = AlertDialog.Builder(context)
+                    build.setIcon(R.drawable.caution)
+                    build.setTitle("系统提示")
+                    build.setMessage("您有未保存的数据，继续关闭吗？")
+                    build.setPositiveButton("是", object : DialogInterface.OnClickListener {
+                        override fun onClick(dialog: DialogInterface, which: Int) {
+                            context.finish()
+                        }
+                    })
+                    build.setNegativeButton("否", null)
+                    build.setCancelable(false)
+                    build.show()
+
+                } else {
+                    context.finish()
+                }
+            }
+            R.id.btn_appointment -> { // 预约
+                if(checkDatas.size == 0) {
+                    Comm.showWarnDialog(context,"请先扫描条码，然后预约！")
+                    return
+                }
+                if(salOrderEntry!!.combineSalOrderId > 0 && checkDatas.size < salOrderEntry!!.combineSalOrderSumRow) {
+                    toasts("当前货物未扫完，不能预约！")
+                    val map = HashMap<Int, Boolean>()
+                    checkDatas.forEach {
+                        map.put(it.forderEntryId, true)
+                    }
+                    val bundle = Bundle()
+                    bundle.putInt("combineSalOrderId", salOrderEntry!!.combineSalOrderId)
+                    bundle.putSerializable("mapEntryId", map)
+                    show(Sal_OutStock_MtlShowActivity::class.java, bundle)
+                    return
+                }
+                showForResult(Logistics_DialogActivity::class.java, SEL_LOGISTICS, null)
+            }
+            R.id.btn_scan -> { // 调用摄像头扫描（物料）
+                ScanUtil.startScan(context, BaseFragment.CAMERA_SCAN, HmsScanAnalyzerOptions.Creator().setHmsScanTypes(HmsScan.ALL_SCAN_TYPE).create())
+            }
+            R.id.btn_save -> { // 保存
+                if(checkDatas.size == 0) {
+                    Comm.showWarnDialog(context,"请扫描条码！")
+                    return
+                }
+                checkDatas.forEachIndexed { index, it ->
+                    if(it.fqty == 0.0) {
+                        Comm.showWarnDialog(context,"第"+(index+1)+"行，请输入数量！")
+                        return
+                    }
+                    if(it.fdcStockId == 0) {
+                        Comm.showWarnDialog(context,"第"+(index+1)+"行，请选择仓库！")
+                        return
+                    }
+                    it.icstockBill = icstockBill
+                }
+                if(deliveryWayRemark.equals("快递") && isNULLS(icstockBill.expressNo).length == 0) {
+                    Comm.showWarnDialog(context,"请先预约快递单号！")
+                    return
+                }
+                if(deliveryWayRemark.equals("物流") && salOrderEntry!!.combineSalOrderId > 0 && checkDatas.size < salOrderEntry!!.combineSalOrderSumRow) {
+                    toasts("当前货物未扫完，请检查！")
+                    val map = HashMap<Int, Boolean>()
+                    checkDatas.forEach {
+                        map.put(it.forderEntryId, true)
+                    }
+
+                    val bundle = Bundle()
+                    bundle.putInt("combineSalOrderId", salOrderEntry!!.combineSalOrderId)
+                    bundle.putSerializable("mapEntryId", map)
+                    show(Sal_OutStock_MtlShowActivity::class.java, bundle)
+                    return
+                }
+                run_save()
+            }
+            R.id.btn_upload -> { // 上传
+                run_uploadToK3(icstockBill.id.toString())
+            }
+            R.id.btn_clone -> { // 重置
+                if (checkDatas.size > 0) {
+                    val build = AlertDialog.Builder(context)
+                    build.setIcon(R.drawable.caution)
+                    build.setTitle("系统提示")
+                    build.setMessage("您有未保存的数据，继续重置吗？")
+                    build.setPositiveButton("是") { dialog, which -> reset() }
+                    build.setNegativeButton("否", null)
+                    build.setCancelable(false)
+                    build.show()
+
+                } else reset()
+            }
+        }
+    }
+
+    private fun reset() {
+        btn_save.visibility = View.VISIBLE
+        btn_upload.visibility = View.GONE
+        btn_appointment.visibility = View.VISIBLE
+        et_code.setText("")
+        et_code.isEnabled = true
+        btn_scan.isEnabled = true
+        lin_focusMtl.setBackgroundResource(R.drawable.back_style_blue)
+        tv_deliveryWayRemark.text = "发货方式："
+        icstockBill.id = 0
+        icstockBill.expressNo = ""
+        checkDatas.clear()
+        salOrderEntry = null
+        deliveryWayRemark = null
+        mAdapter!!.notifyDataSetChanged()
+
+        mHandler.sendEmptyMessage(SETFOCUS)
+    }
+
+    override fun setListener() {
+        val click = View.OnClickListener { v ->
+            setFocusable(et_getFocus)
+            when (v.id) {
+                R.id.et_code -> setFocusable(et_code)
+            }
+        }
+        et_code!!.setOnClickListener(click)
+
+        // 物料---数据变化
+        et_code!!.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable) {
+                if (s.length == 0) return
+                if (!isTextChange) {
+                    isTextChange = true
+                    smqFlag = '2'
+                    mHandler.sendEmptyMessageDelayed(SAOMA, 300)
+                }
+            }
+        })
+        // 物料---长按输入条码
+        et_code!!.setOnLongClickListener {
+            smqFlag = '2'
+            showInputDialog("输入条码号", getValues(et_code), "none", WRITE_CODE)
+            true
+        }
+        // 物料---焦点改变
+        et_code.onFocusChangeListener = View.OnFocusChangeListener { v, hasFocus ->
+            if(hasFocus) {
+                lin_focusMtl.setBackgroundResource(R.drawable.back_style_red_focus)
+            } else {
+                if (lin_focusMtl != null) {
+                    lin_focusMtl.setBackgroundResource(R.drawable.back_style_gray4)
+                }
+            }
+        }
+    }
+
+    /**
+     *  扫码之后    物料启用批次
+     */
+    fun setBatchCode(fqty : Double) {
+        val entryBarcode = ICStockBillEntry_Barcode()
+        entryBarcode.parentId = 0
+        entryBarcode.barcode = getValues(et_code)
+        entryBarcode.batchCode = salOrderEntry!!.smBatchCode
+        entryBarcode.snCode = ""
+        entryBarcode.fqty = fqty
+        entryBarcode.isUniqueness = 'Y'
+        entryBarcode.againUse = 1
+        entryBarcode.createUserName = user!!.username
+        entryBarcode.billType = "XSCK"
+
+        var addVal = BigdecimalUtil.add(checkDatas[curPos].fqty, fqty)
+        checkDatas[curPos].fqty = addVal
+        checkDatas[curPos].icstockBillEntry_Barcodes.add(entryBarcode)
+        mAdapter!!.notifyDataSetChanged()
+    }
+
+    /**
+     *  扫码之后    物料启用序列号
+     */
+    fun setSnCode() {
+        val entryBarcode = ICStockBillEntry_Barcode()
+        entryBarcode.parentId = 0
+        entryBarcode.barcode = getValues(et_code)
+        entryBarcode.batchCode = ""
+        entryBarcode.snCode = salOrderEntry!!.smSnCode
+        entryBarcode.fqty = 1.0
+        entryBarcode.isUniqueness = 'Y'
+        entryBarcode.againUse = 1
+        entryBarcode.createUserName = user!!.username
+        entryBarcode.billType = "XSCK"
+
+        var addVal = BigdecimalUtil.add(checkDatas[curPos].fqty, 1.0)
+        checkDatas[curPos].fqty = addVal
+        checkDatas[curPos].icstockBillEntry_Barcodes.add(entryBarcode)
+        mAdapter!!.notifyDataSetChanged()
+    }
+
+    /**
+     *  扫码之后    物料未启用
+     */
+    fun unStartBatchOrSnCode(fqty : Double) {
+        val entryBarcode = ICStockBillEntry_Barcode()
+        entryBarcode.parentId = 0
+        entryBarcode.barcode = getValues(et_code)
+        entryBarcode.batchCode = ""
+        entryBarcode.snCode = ""
+        entryBarcode.fqty = fqty
+        entryBarcode.isUniqueness = 'N'
+        entryBarcode.againUse = 1
+        entryBarcode.createUserName = user!!.username
+        entryBarcode.billType = "XSCK"
+
+        var addVal = BigdecimalUtil.add(checkDatas[curPos].fqty, fqty)
+        checkDatas[curPos].fqty = addVal
+        checkDatas[curPos].icstockBillEntry_Barcodes.add(entryBarcode)
+        mAdapter!!.notifyDataSetChanged()
+    }
+
+    private fun getMtl() {
+        var isAdd = true // 是新增，否修改
+        curPos = -1
+        var material = salOrderEntry!!.material
+        // 判断扫描的物料是否与行里面的一样
+        checkDatas.forEachIndexed { index, it ->
+            if(it.forderInterId == salOrderEntry!!.fid && it.forderEntryId == salOrderEntry!!.fentryId) {
+                curPos = index
+                material = checkDatas[index].material
+                isAdd = false
+            }
+        }
+        // 判断条码是否存在（启用批次，序列号）
+        if (!isAdd && checkDatas[curPos].icstockBillEntry_Barcodes.size > 0 && (material.isBatchManager == 1 || material.isSnManager == 1)) {
+            checkDatas[curPos].icstockBillEntry_Barcodes.forEach {
+                if (getValues(et_code).length > 0 && getValues(et_code) == it.barcode) {
+                    Comm.showWarnDialog(context,"条码已使用！")
+                    return
+                }
+            }
+        }
+        if(isAdd) {
+            addICStockBillEntry()
+        }
+
+        if(material.isBatchManager == 1) { // 启用批次号
+            /*val showInfo:String = "<font color='#666666'>批次号：</font>" + salOrderEntry!!.smBatchCode
+            showInputDialog("数量", showInfo, salOrderEntry!!.smQty.toString(), "0.0", SM_RESULT_NUM)*/
+            setBatchCode(salOrderEntry!!.fqty)
+
+        } else if(material.isSnManager == 1) { // 启用序列号
+            setSnCode()
+
+        } else { // 未启用
+            // 出库数小于源单数
+            if(checkDatas[curPos].fqty < salOrderEntry!!.usableQty) {
+                unStartBatchOrSnCode(salOrderEntry!!.usableQty)
+            }
+        }
+        // 是否查询配件
+        /*
+        var searchPJ = true
+        checkDatas.forEach {
+            if(it.fsourceInterId == 0) searchPJ = false
+        }
+        if(searchPJ) {
+            run_findAutoBringMtl(salOrderEntry!!.fid.toString())
+        }*/
+        run_findAutoBringMtl(salOrderEntry!!.fid.toString())
+    }
+
+    private fun setICStockBIll() {
+        val salOrder = salOrderEntry!!.salOrder
+        icstockBill.empNumber = salOrder.saleMan.fnumber
+        icstockBill.empName = salOrder.saleMan.fname
+        icstockBill.fstockOrgId = salOrderEntry!!.fstockOrgId
+        icstockBill.fstockOutOrgId = salOrder.saleOrg.forgId
+        icstockBill.stockOrg = salOrderEntry!!.stockOrg
+        icstockBill.stockOutOrg = salOrder.saleOrg
+        icstockBill.fbillTypeNumber = "XSCKD01_SYS" // 销售订单据类型（标准销售出库单）
+        icstockBill.fownerType = "BD_OwnerOrg"
+        icstockBill.fownerNumber = salOrderEntry!!.stockOrg.fnumber
+        icstockBill.fownerName = salOrderEntry!!.stockOrg.fname
+
+        icstockBill.fcustId = salOrder.fcustId
+        icstockBill.deliveryWayNumber = salOrder.deliveryWayNumber
+        icstockBill.deliveryWayName = salOrder.deliveryWayName
+        if(!deliveryWayRemark.equals("快递")) {   // 非快递的，就读取销售订单上填的快递单，否则要预约
+            icstockBill.expressNo = isNULLS(salOrder.expressNo).trim()
+        }
+        icstockBill.receiveAddress = salOrder.receiveAddress
+        icstockBill.receiveContact = salOrder.receiveContact
+        icstockBill.receivePhone = Comm.getValidMobile(salOrder.receiveTel)
+        icstockBill.combineSalOrderId = salOrderEntry!!.combineSalOrderId
+        if(salOrder.saleDept != null) {
+            icstockBill.recDeptId = salOrder.saleDept.fdeptId
+            icstockBill.recDept = salOrder.saleDept
+        }
+    }
+
+    /**
+     * 新增行数据
+     */
+    private fun addICStockBillEntry() {
+        // 设置表头信息
+        if(checkDatas.size == 0) {
+            setICStockBIll()
+        }
+
+        val entry = ICStockBillEntry()
+        entry.icstockBill = icstockBill
+        entry.icstockBillId = 0
+        entry.mtlId = salOrderEntry!!.fmaterialId
+        if(stock != null) {
+            entry.fdcStockId = stock!!.fstockId
+            entry.stock = stock
+        }
+        entry.fprice = salOrderEntry!!.fprice
+        entry.funitId = salOrderEntry!!.funitId
+        entry.frowType = salOrderEntry!!.frowType
+        entry.fsourceInterId = salOrderEntry!!.prdMoId
+        entry.fsourceEntryId = salOrderEntry!!.prdMoEntryId
+        entry.fsourceSeq = 0
+        entry.fsourceBillNo = salOrderEntry!!.prdMoNo
+        entry.fsourceQty = salOrderEntry!!.usableQty
+        entry.forderInterId = salOrderEntry!!.fid
+        entry.forderEntryId = salOrderEntry!!.fentryId
+        entry.forderBillNo = salOrderEntry!!.salOrder.fbillNo
+        entry.forderSeq = salOrderEntry!!.fseq
+        entry.forderDate = salOrderEntry!!.salOrder.fdate.substring(0,10)
+        entry.fisFree = salOrderEntry!!.fisFree
+        entry.jtks = salOrderEntry!!.jtks
+        entry.remark = salOrderEntry!!.fnote
+        entry.custMtlId = salOrderEntry!!.fmapId
+        entry.fsrcBillTypeId = "SAL_SaleOrder"
+        entry.fentity_Link_FRuleId = "SaleOrder-OutStock"
+        entry.fentity_Link_FSTableName = "T_SAL_ORDERENTRY"
+        if(salOrderEntry!!.material.personal > 0 && isNULLS(salOrderEntry!!.personalCarVersionNumber).length > 0) {
+            entry.carVersionNumber = salOrderEntry!!.personalCarVersionNumber
+            entry.carVersionLocation = salOrderEntry!!.personalCarVersionLocation
+            entry.carVersionName = salOrderEntry!!.personalCarVersionName
+        }
+        entry.fownerNumber = icstockBill.stockOrg.fnumber
+        entry.fownerName = icstockBill.stockOrg.fname
+        entry.fauxpropid_103_number = isNULLS(salOrderEntry!!.fauxpropid_103_number)
+        entry.fauxpropid_103_name = isNULLS(salOrderEntry!!.fauxpropid_103_name)
+        entry.fauxpropid_104_number = isNULLS(salOrderEntry!!.fauxpropid_104_number)
+        entry.fauxpropid_104_name = isNULLS(salOrderEntry!!.fauxpropid_104_name)
+        entry.fauxpropid_105_number = isNULLS(salOrderEntry!!.fauxpropid_105_number)
+        entry.fauxpropid_105_name = isNULLS(salOrderEntry!!.fauxpropid_105_name)
+        entry.fauxpropid_106_number = isNULLS(salOrderEntry!!.fauxpropid_106_number)
+        entry.fauxpropid_106_name = isNULLS(salOrderEntry!!.fauxpropid_106_name)
+
+        entry.material = salOrderEntry!!.material
+        entry.unit = salOrderEntry!!.unit
+        checkDatas.add(entry)
+        curPos = checkDatas.size -1
+    }
+
+    /**
+     * 新增行（销售订单--赠品）
+     */
+    private fun addRow_salOrder(list : List<SalOrderEntry>) {
+        val mapCheckExist = HashMap<String, Boolean>()
+//        val mapExist = HashMap<String, Boolean>()
+        checkDatas.forEach {
+            mapCheckExist[it.forderInterId.toString()+"_"+it.forderEntryId.toString()] = true
+        }
+
+        list.forEach {
+            if(!mapCheckExist.containsKey(it.fid.toString()+"_"+it.fentryId.toString())) {
+                val entry = ICStockBillEntry()
+                entry.icstockBill = icstockBill
+                entry.icstockBillId = 0
+                entry.mtlId = it.fmaterialId
+                if(stock != null) {
+                    entry.fdcStockId = stock!!.fstockId
+                    entry.stock = stock
+                }
+                entry.fqty = it.usableQty
+                entry.fprice = it.fprice
+                entry.funitId = it.funitId
+                entry.frowType = it.frowType
+                entry.fsourceInterId = it.prdMoId
+                entry.fsourceEntryId = it.prdMoEntryId
+                entry.fsourceSeq = 0
+                entry.fsourceBillNo = it.prdMoNo
+                entry.fsourceQty = it.usableQty
+                entry.forderInterId = it.fid
+                entry.forderEntryId = it.fentryId
+                entry.forderBillNo = it.salOrder.fbillNo
+                entry.forderSeq = it.fseq
+                entry.forderDate = it.salOrder.fdate.substring(0,10)
+                entry.fisFree = it.fisFree
+                entry.jtks = it.jtks
+                entry.remark = it.fnote
+                entry.custMtlId = it.fmapId
+                entry.fsrcBillTypeId = "SAL_SaleOrder"
+                entry.fentity_Link_FRuleId = "SaleOrder-OutStock"
+                entry.fentity_Link_FSTableName = "T_SAL_ORDERENTRY"
+                if(it.material.personal > 0 && isNULLS(it.personalCarVersionNumber).length > 0) {
+                    entry.carVersionNumber = it.personalCarVersionNumber
+                    entry.carVersionLocation = it.personalCarVersionLocation
+                    entry.carVersionName = it.personalCarVersionName
+                }
+                entry.fownerNumber = icstockBill.stockOrg.fnumber
+                entry.fownerName = icstockBill.stockOrg.fname
+                entry.fauxpropid_103_number = isNULLS(it.fauxpropid_103_number)
+                entry.fauxpropid_103_name = isNULLS(it.fauxpropid_103_name)
+                entry.fauxpropid_104_number = isNULLS(it.fauxpropid_104_number)
+                entry.fauxpropid_104_name = isNULLS(it.fauxpropid_104_name)
+                entry.fauxpropid_105_number = isNULLS(it.fauxpropid_105_number)
+                entry.fauxpropid_105_name = isNULLS(it.fauxpropid_105_name)
+                entry.fauxpropid_106_number = isNULLS(it.fauxpropid_106_number)
+                entry.fauxpropid_106_name = isNULLS(it.fauxpropid_106_name)
+
+                entry.material = it.material
+                entry.unit = it.unit
+                checkDatas.add(entry)
+                curPos = checkDatas.size -1
+
+//            } else {
+//                // 如果存在，就给赠品字段赋值
+//                mapExist[it.fid.toString()+"_"+it.fentryId.toString()] = true
+            }
+        }
+//        if(mapExist.size > 0) {
+//            checkDatas.forEach {
+//                if(mapExist.containsKey(it.forderInterId.toString()+"_"+it.forderEntryId.toString())) {
+//                    it.fisFree = 1
+//                }
+//            }
+//        }
+
+        mAdapter!!.notifyDataSetChanged()
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (resultCode == Activity.RESULT_OK) {
+            if (data == null) return
+            when (requestCode) {
+                SEL_STOCK -> {// 仓库	返回
+                    val stock = data!!.getSerializableExtra("obj") as Stock_K3
+                    checkDatas[curPos].fdcStockId = stock.fstockId
+                    checkDatas[curPos].stock = stock
+                    mAdapter!!.notifyDataSetChanged()
+                }
+                RESULT_NUM -> { // 数量	返回
+                    val bundle = data!!.getExtras()
+                    if (bundle != null) {
+                        val value = bundle.getString("resultValue", "")
+                        val num = parseDouble(value)
+                        checkDatas[curPos].fqty = num
+                        mAdapter!!.notifyDataSetChanged()
+                    }
+                }
+                SM_RESULT_NUM -> { // 扫码数量	    返回
+                    val bundle = data!!.getExtras()
+                    if (bundle != null) {
+                        val value = bundle.getString("resultValue", "")
+                        val num = parseDouble(value)
+                        setBatchCode(num)
+                    }
+                }
+                WRITE_CODE -> {// 输入条码  返回
+                    val bundle = data!!.extras
+                    if (bundle != null) {
+                        val value = bundle.getString("resultValue", "")
+                        setTexts(et_code, value.toUpperCase())
+                    }
+                }
+                BaseFragment.CAMERA_SCAN -> {// 扫一扫成功  返回
+                    val hmsScan = data!!.getParcelableExtra(ScanUtil.RESULT) as HmsScan
+                    if (hmsScan != null) {
+                        setTexts(et_code, hmsScan.originalValue)
+                    }
+                }
+                SEL_LOGISTICS -> {// 物流公司	返回
+                    logistics = data!!.getSerializableExtra("obj") as Logistics
+//                    showInputDialog("预约个数", "1", "0", RESULT_YUYUE)
+                    run_saoOutStock_appointment(checkDatas[0].forderBillNo, 1)
+                }
+                RESULT_YUYUE -> { // 预约数量返回
+                    val bundle = data!!.getExtras()
+                    if (bundle != null) {
+                        val value = bundle.getString("resultValue", "")
+                        var num = parseInt(value)
+                        if (num == 0) {
+                            num = 1
+                        }
+                        run_saoOutStock_appointment(checkDatas[0].forderBillNo, num)
+                    }
+                }
+                /*蓝牙连接*/
+                Constant.BLUETOOTH_REQUEST_CODE -> {
+                    /*获取蓝牙mac地址*/
+                    val macAddress = data!!.getStringExtra(BluetoothDeviceListDialog.EXTRA_DEVICE_ADDRESS)
+                    //初始化话DeviceConnFactoryManager
+                    DeviceConnFactoryManager.Build()
+                            .setId(id)
+                            //设置连接方式
+                            .setConnMethod(DeviceConnFactoryManager.CONN_METHOD.BLUETOOTH)
+                            //设置连接的蓝牙mac地址
+                            .setMacAddress(macAddress)
+                            .build()
+                    //打开端口
+                    DeviceConnFactoryManager.getDeviceConnFactoryManagers()[id].openPort()
+                }
+            }
+        }
+        mHandler.sendEmptyMessageDelayed(SETFOCUS, 200)
+    }
+
+    /**
+     * 扫码查询对应的方法
+     */
+    private fun run_smDatas() {
+        isTextChange = false
+        val saleOrderId = if(checkDatas.size > 0) checkDatas[0].forderInterId.toString() else ""
+
+        showLoadDialog("加载中...", false)
+        var mUrl = getURL("salOrder/findBarocde")
+        val formBody = FormBody.Builder()
+                .add("barcode", getValues(et_code))
+                .add("saleOrderId", saleOrderId) // 销售订单id
+                .build()
+
+        val request = Request.Builder()
+                .addHeader("cookie", getSession())
+                .url(mUrl)
+                .post(formBody)
+                .build()
+
+        val call = okHttpClient!!.newCall(request)
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                mHandler.sendEmptyMessage(UNSUCC1)
+            }
+
+            @Throws(IOException::class)
+            override fun onResponse(call: Call, response: Response) {
+                val body = response.body()
+                val result = body.string()
+                LogUtil.e("run_smDatas --> onResponse", result)
+                if (!JsonUtil.isSuccess(result)) {
+                    val msg = mHandler.obtainMessage(UNSUCC1, result)
+                    mHandler.sendMessage(msg)
+                    return
+                }
+                val msg = mHandler.obtainMessage(SUCC1, result)
+                mHandler.sendMessage(msg)
+            }
+        })
+    }
+
+    /**
+     * 保存
+     */
+    private fun run_save() {
+        showLoadDialog("保存中...", false)
+        val mUrl = getURL("stockBill_WMS/saveGroup")
+
+        val mJson = JsonUtil.objectToString(checkDatas)
+        val formBody = FormBody.Builder()
+                .add("strJson", mJson)
+                .build()
+
+        val request = Request.Builder()
+                .addHeader("cookie", getSession())
+                .url(mUrl)
+                .post(formBody)
+                .build()
+
+        val call = okHttpClient!!.newCall(request)
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                mHandler.sendEmptyMessage(UNSAVE)
+            }
+
+            @Throws(IOException::class)
+            override fun onResponse(call: Call, response: Response) {
+                val body = response.body()
+                val result = body.string()
+                if (!JsonUtil.isSuccess(result)) {
+                    val msg = mHandler.obtainMessage(UNSAVE, result)
+                    mHandler.sendMessage(msg)
+                    return
+                }
+                val msg = mHandler.obtainMessage(SAVE, result)
+                LogUtil.e("run_save --> onResponse", result)
+                mHandler.sendMessage(msg)
+            }
+        })
+    }
+
+    /**
+     * 上传单据
+     */
+    private fun run_uploadToK3(icstockBillId: String) {
+        showLoadDialog("上传中...", false)
+        val mUrl = getURL("stockBill_WMS/uploadToK3_SalOutStock")
+        val formBody = FormBody.Builder()
+                .add("strId", icstockBillId)
+                .build()
+
+        val request = Request.Builder()
+                .addHeader("cookie", getSession())
+                .url(mUrl)
+                .post(formBody)
+                .build()
+
+        val call = okHttpClient!!.newCall(request)
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                mHandler.sendEmptyMessage(UNUPLOAD)
+            }
+
+            @Throws(IOException::class)
+            override fun onResponse(call: Call, response: Response) {
+                val body = response.body()
+                val result = body.string()
+                LogUtil.e("run_uploadToK3 --> onResponse", result)
+                if (!JsonUtil.isSuccess(result)) {
+                    val msg = mHandler.obtainMessage(UNUPLOAD, result)
+                    mHandler.sendMessage(msg)
+                    return
+                }
+                val msg = mHandler.obtainMessage(UPLOAD, result)
+                mHandler.sendMessage(msg)
+            }
+        })
+    }
+
+    /**
+     * 查询预约的数据
+     */
+    fun run_saoOutStock_appointment(salOrderNo :String, num :Int) {
+        if(salOrderEntry!!.salOrder.saleMan.fmobile == null) {
+            Comm.showWarnDialog(context,"对应的业务员没有维护手机号！")
+            return
+        }
+
+        val mapBarcode = HashMap<String, String>()
+        checkDatas.forEach {
+            for (icstockBillEntry_Barcode in it.icstockBillEntry_Barcodes) {
+                mapBarcode[icstockBillEntry_Barcode.barcode] = it.forderBillNo
+            }
+        }
+        showLoadDialog("准备打印...", false)
+        val mUrl = getURL("appPrint/saoOutStock_appointment")
+        var strLogistics = JsonUtil.objectToString(logistics!!)
+        val formBody = FormBody.Builder()
+                .add("so_id", salOrderNo)
+                .add("num", num.toString())
+                .add("strLogistics", strLogistics)      // 快递公司
+                .add("address", icstockBill.receiveAddress)             // 收件地址
+                .add("receiverName", icstockBill.receiveContact)        // 收件人
+//                .add("receiverZip", icstockBill.receiveAddress)                   // 收件地址邮编
+                .add("receiverMobile", icstockBill.receivePhone)      // 收件人电话
+                .add("sendMan", salOrderEntry!!.salOrder.createMan.fname)        // 寄件人
+                .add("sendPhone", salOrderEntry!!.salOrder.createMan.fmobile)    // 寄件人电话
+                .add("sendCustName", salOrderEntry!!.salOrder.saleCust.fname)    // 寄件客户
+                .add("userId", user!!.id.toString())
+                .add("strBarcode", JsonUtil.objectToString(mapBarcode))
+                .add("userName", user!!.username)
+                .build()
+
+        val request = Request.Builder()
+                .addHeader("cookie", getSession())
+                .url(mUrl)
+                .post(formBody)
+                .build()
+
+        val call = okHttpClient!!.newCall(request)
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                mHandler.sendEmptyMessage(UNSUCC4)
+            }
+
+            @Throws(IOException::class)
+            override fun onResponse(call: Call, response: Response) {
+                val body = response.body()
+                val result = body.string()
+                LogUtil.e("run_saoOutStock_appointment --> onResponse", result)
+                if (!JsonUtil.isSuccess(result)) {
+                    val msg = mHandler.obtainMessage(UNSUCC4, result)
+                    mHandler.sendMessage(msg)
+                    return
+                }
+                val msg = mHandler.obtainMessage(SUCC4, result)
+                mHandler.sendMessage(msg)
+            }
+        })
+    }
+
+    /**
+     * 自动带出配件
+     */
+    private fun run_findAutoBringMtl(fid :String) {
+        showLoadDialog("加载中...", false)
+
+        var mUrl = getURL("salOrder/findAutoBringMtl")
+        val formBody = FormBody.Builder()
+                .add("fid", fid)
+                .build()
+
+        val request = Request.Builder()
+                .addHeader("cookie", getSession())
+                .url(mUrl)
+                .post(formBody)
+                .build()
+
+        val call = okHttpClient!!.newCall(request)
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                mHandler.sendEmptyMessage(UNSUCC5)
+            }
+
+            @Throws(IOException::class)
+            override fun onResponse(call: Call, response: Response) {
+                val body = response.body()
+                val result = body.string()
+                if (!JsonUtil.isSuccess(result)) {
+                    val msg = mHandler.obtainMessage(UNSUCC5, result)
+                    mHandler.sendMessage(msg)
+                    return
+                }
+                val msg = mHandler.obtainMessage(SUCC5, result)
+                LogUtil.e("run_findAutoBringMtl --> onResponse", result)
+                mHandler.sendMessage(msg)
+            }
+        })
+    }
+
+    /**
+     * Fragment回调得到数据
+     */
+    fun print(list: List<ExpressNoData>) {
+        listMap.clear()
+        listMap.addAll(list)
+
+        if (isConnected) {
+            startPrint(list)
+        } else {
+            // 打开蓝牙配对页面
+            startActivityForResult(Intent(this, BluetoothDeviceListDialog::class.java), Constant.BLUETOOTH_REQUEST_CODE)
+        }
+    }
+
+    /**
+     * 原丰蜜打印
+     */
+    private fun startPrint(list: List<ExpressNoData>) {
+        list.forEach {
+            val curDate = Comm.getSysDate(0)
+            setPrintFormat(curDate, it) // 第一次打印是发货
+            setPrintFormat(curDate, it) // 第二次打印是给自己留底
+        }
+    }
+
+    /**
+     * 设置打印的格式
+     */
+    private fun setPrintFormat(curDate :String, it :ExpressNoData) {
+        val tsc = LabelCommand()
+        setTscBegin(tsc, 10)
+        // --------------- 打印区-------------Begin
+
+        // 上下流水结构，先画线后打印其他
+        // （左）画竖线
+        tsc.addBar(20, 200, 2, 610)
+        // （右上）画横线
+        tsc.addBar(20, 200, 560, 2)
+        // （右）画竖线
+        tsc.addBar(580, 200, 2, 610)
+        // （左下）画横线
+        tsc.addBar(20, 810, 560, 2)
+
+        // 面横线（寄方月结上边）
+        tsc.addBar(20, 380, 560, 2)
+        // 面横线（寄方月结下边）1横线
+        tsc.addBar(20, 420, 200, 2)
+        // 面横线（寄方月结下边）2横线
+        tsc.addBar(20, 480, 200, 2)
+        // 画竖线（寄方月结右边）
+        tsc.addBar(220, 380, 2, 170)
+        // 画竖线（二维码右面）
+        tsc.addBar(400, 380, 2, 170)
+        /*
+        // 画竖线（已验视右边）
+        tsc.addBar(450, 380, 2, 170)
+        // 画横线（AB表下面）
+        tsc.addBar(452, 480, 128, 2)
+        */
+        // 画横线（寄件人上面）
+        tsc.addBar(20, 550, 560, 2)
+        // 画横线（寄件人下面）
+        tsc.addBar(20, 680, 560, 2)
+
+
+        // 打印时间
+        tsc.addText(220, 40, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, "打印时间："+curDate)
+        // （左）条码
+        tsc.add1DBarcode(40, 90, LabelCommand.BARCODETYPE.CODE39, 80, LabelCommand.READABEL.EANBEL, LabelCommand.ROTATION.ROTATION_0, 2, 5, it.getT01())   // 顺丰快递单
+        // 目的地
+        tsc.addText(50, 210, LabelCommand.FONTTYPE.FONT_2, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_3, LabelCommand.FONTMUL.MUL_3, it.getT02()+"")   // 目的地
+        tsc.addText(472, 210, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_2, LabelCommand.FONTMUL.MUL_2, "电商")   // 电商标快
+        tsc.addText(472, 260, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_2, LabelCommand.FONTMUL.MUL_2, "标快")   // 电商标快
+
+        // 收件人图片
+        val shouBit = BitmapFactory.decodeResource(resources, R.drawable.shunfeng_shou)
+        if(shouBit != null) {
+            tsc.addBitmap(40, 290, LabelCommand.BITMAP_MODE.OVERWRITE, 53, shouBit)
+        }
+        tsc.addText(115, 290, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, it.getT10()+"") // 收方人
+        tsc.addText(260, 290, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, it.getT11()+"") // 收方电话
+        // 收件地址超长，计算自动换行（计算两行）
+        val t12 = it.getT12()
+        val t12Len = t12!!.length
+        if(t12Len > 20) { // 每一行最多显示20个字符串
+            tsc.addText(115, 320, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, t12.substring(0, 20)+ "") // 收方地址
+            if(t12.substring(20, t12Len).trim().length > 0) {
+                tsc.addText(115, 350, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, t12.substring(20, t12Len)+ "") // 收方地址
+            }
+        } else {
+            tsc.addText(115, 320, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, t12+ "") // 收方地址
+        }
+
+        // 寄付月结
+        tsc.addText(60, 386, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, it.getT05()+"")
+        // 寄付月结下面1
+        tsc.addText(100, 435, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_2, LabelCommand.FONTMUL.MUL_2, "020")
+        // 寄付月结下面2
+        tsc.addText(40, 498, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_2, LabelCommand.FONTMUL.MUL_2, it.destTeamCode)
+        // 顺丰二维码图片
+        if(it.twoDimensionCode.length > 0) {
+            tsc.addQRCode(230, 390, LabelCommand.EEC.LEVEL_L, 4, LabelCommand.ROTATION.ROTATION_0, it.twoDimensionCode)
+        }
+        // 显示销售订单号
+        val listSalOrderNo = it.salOrderNo.split(",")
+        var yCoune = 0
+        for (s in listSalOrderNo) {
+            tsc.addText(408, (386+yCoune), LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, s + "")
+            yCoune += 30
+            if(yCoune == 150) break
+        }
+
+        // 寄件人图片
+        val jiBit = BitmapFactory.decodeResource(resources, R.drawable.shunfeng_ji)
+        tsc.addBitmap(40, 580, LabelCommand.BITMAP_MODE.OVERWRITE, 53, jiBit)
+        // 寄方人
+        tsc.addText(115, 566, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, it.getT15()+"")
+        // 寄方电话
+        tsc.addText(260, 566, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, it.getT16()+"")
+        // 寄方地址
+        // 寄方地址超长，计算自动换行（计算两行）
+        val t17 = it.getT17()
+        val t17Len = t17!!.length
+        if(t17Len > 20) {
+            tsc.addText(115, 590, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, t17.substring(0, 20)+ "") // 寄方地址
+            if(t17.substring(20, t17Len).trim().length > 0) {
+                tsc.addText(115, 620, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, t17.substring(20, t17Len)+ "") // 寄方地址
+            }
+        } else {
+            tsc.addText(115, 590, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, t17+ "") // 收方地址
+        }
+
+        // 寄托物
+        tsc.addText(30, 690, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, "寄托物："+it.t18+"")
+        tsc.addText(30, 720, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, "增值服务： ")
+        tsc.addText(30, 750, LabelCommand.FONTTYPE.SIMPLIFIED_CHINESE, LabelCommand.ROTATION.ROTATION_0, LabelCommand.FONTMUL.MUL_1, LabelCommand.FONTMUL.MUL_1, "备注： ")
+
+        // --------------- 打印区-------------End
+        setTscEnd(tsc)
+    }
+
+    /**
+     * 打印前段配置
+     * @param tsc
+     */
+    private fun setTscBegin(tsc: LabelCommand, gap: Int) {
+        // 设置标签尺寸，按照实际尺寸设置
+        tsc.addSize(75, 105)
+        // 设置标签间隙，按照实际尺寸设置，如果为无间隙纸则设置为0
+        tsc.addGap(gap)
+        // 设置打印方向
+        tsc.addDirection(LabelCommand.DIRECTION.FORWARD, LabelCommand.MIRROR.NORMAL)
+        // 开启带Response的打印，用于连续打印
+        tsc.addQueryPrinterStatus(LabelCommand.RESPONSE_MODE.ON)
+        // 设置原点坐标
+        tsc.addReference(0, 0)
+        // 撕纸模式开启
+        tsc.addTear(EscCommand.ENABLE.ON)
+        // 清除打印缓冲区
+        tsc.addCls()
+    }
+
+    /**
+     * 打印后段配置
+     * @param tsc
+     */
+    private fun setTscEnd(tsc: LabelCommand) {
+        // 打印标签
+        tsc.addPrint(1, 1)
+        // 打印标签后 蜂鸣器响
+
+        tsc.addSound(2, 100)
+        tsc.addCashdrwer(LabelCommand.FOOT.F5, 255, 255)
+        val datas = tsc.command
+        // 发送数据
+        if (DeviceConnFactoryManager.getDeviceConnFactoryManagers()[id] == null) {
+            return
+        }
+        DeviceConnFactoryManager.getDeviceConnFactoryManagers()[id].sendDataImmediately(datas)
+    }
+
+    /**
+     * 得到用户对象
+     */
+    private fun getUserInfo() {
+        if (user == null) user = showUserByXml()
+    }
+
+    /**
+     * 蓝牙监听广播
+     */
+    private val receiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val action = intent.action
+            when (action) {
+                // 蓝牙连接断开广播
+                UsbManager.ACTION_USB_DEVICE_DETACHED, BluetoothDevice.ACTION_ACL_DISCONNECTED -> mHandler.obtainMessage(CONN_STATE_DISCONN).sendToTarget()
+                DeviceConnFactoryManager.ACTION_CONN_STATE -> {
+                    val state = intent.getIntExtra(DeviceConnFactoryManager.STATE, -1)
+                    val deviceId = intent.getIntExtra(DeviceConnFactoryManager.DEVICE_ID, -1)
+                    when (state) {
+                        DeviceConnFactoryManager.CONN_STATE_DISCONNECT -> if (id == deviceId) {
+                            tv_connState.setText(getString(R.string.str_conn_state_disconnect))
+                            tv_connState.setTextColor(Color.parseColor("#666666")) // 未连接-灰色
+                            isConnected = false
+                        }
+                        DeviceConnFactoryManager.CONN_STATE_CONNECTING -> {
+                            tv_connState.setText(getString(R.string.str_conn_state_connecting))
+                            tv_connState.setTextColor(Color.parseColor("#6a5acd")) // 连接中-紫色
+                            isConnected = false
+                        }
+                        DeviceConnFactoryManager.CONN_STATE_CONNECTED -> {
+                            //                            tv_connState.setText(getString(R.string.str_conn_state_connected) + "\n" + getConnDeviceInfo());
+                            tv_connState.setText(getString(R.string.str_conn_state_connected))
+                            tv_connState.setTextColor(Color.parseColor("#008800")) // 已连接-绿色
+                            // 连接成功，开始打印
+                            startPrint(listMap)
+
+                            isConnected = true
+                        }
+                        CONN_STATE_FAILED -> {
+                            Utils.toast(context, getString(R.string.str_conn_fail))
+                            tv_connState.setText(getString(R.string.str_conn_state_disconnect))
+                            tv_connState.setTextColor(Color.parseColor("#666666")) // 未连接-灰色
+                            isConnected = false
+                        }
+                        else -> {
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val filter = IntentFilter()
+        filter.addAction(BluetoothDevice.ACTION_FOUND)
+        filter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        filter.addAction(DeviceConnFactoryManager.ACTION_CONN_STATE)
+        registerReceiver(receiver, filter)
+        // 判断是否打开蓝牙
+        val adapter  = BluetoothAdapter.getDefaultAdapter();
+        val isEnable = adapter.isEnabled();
+        if(!isEnable) {
+            toasts("请打开蓝牙，并连接上打印机，2秒后退出当前界面！")
+            mHandler.postDelayed(Runnable {
+                context.finish()
+            },2000)
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        unregisterReceiver(receiver)
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            closeHandler(mHandler)
+            context.finish()
+        }
+        return false
+    }
+
+    override fun onDestroy() {
+        closeHandler(mHandler)
+        DeviceConnFactoryManager.closeAllPort()
+        if (threadPool != null) {
+            threadPool!!.stopThreadPool()
+        }
+        super.onDestroy()
+    }
+
+}
